@@ -31,6 +31,8 @@ bun run migration:up
 bun run migration:down
 ```
 
+O schema financeiro usa `NUMERIC` do PostgreSQL sem converter valores para ponto flutuante; no MikroORM, colunas decimais são hidratadas como `string`. As migrations criam `wallets`, `wager_transactions`, `wallet_ledger_entries`, `inbox_messages` e `outbox_messages`. Constraints e índices cobrem unicidade de wallet por jogador/moeda, idempotência por provider/key, referências, valores não negativos e escala de duas casas. Triggers deferred validam consistência entre saldo, versão, ledger e transações ao commit; triggers impedem alteração, exclusão ou truncamento de lançamentos.
+
 ## Regras do domínio
 
 - Wallet aceita saldo inicial não negativo, inicia na versão `1` e incrementa a versão somente quando um débito ou crédito válido altera o saldo. Uma movimentação retorna seu lançamento balanceado no ledger.
