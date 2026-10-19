@@ -58,6 +58,11 @@ const WagerTransactionSchema = defineEntity({
       .integer()
       .fieldName('result_wallet_version')
       .nullable(),
+    referenceAttempts: p.integer().fieldName('reference_attempts').default(0),
+    nextReferenceAttemptAt: p
+      .datetime()
+      .fieldName('next_reference_attempt_at')
+      .nullable(),
     createdAt: p.datetime().fieldName('created_at'),
     processedAt: p.datetime().fieldName('processed_at').nullable(),
   },
@@ -88,6 +93,12 @@ const WagerTransactionSchema = defineEntity({
     {
       properties: ['status', 'createdAt'],
       name: 'wager_transactions_status_created_idx',
+    },
+    {
+      properties: ['nextReferenceAttemptAt', 'createdAt'],
+      name: 'wager_transactions_reference_retry_due_idx',
+      where:
+        `"status" = 'PENDING_REFERENCE' and "next_reference_attempt_at" is not null`,
     },
     {
       properties: ['providerId', 'referenceExternalTransactionId'],

@@ -3,6 +3,11 @@ import { Test, TestingModule } from '@nestjs/testing';
 import type { App } from 'supertest/types.js';
 import request from 'supertest';
 import { AppModule } from '../src/app.module.js';
+import { MikroORM } from '@mikro-orm/core';
+
+process.env.WAGER_REFERENCE_MAX_ATTEMPTS = '4';
+process.env.WAGER_REFERENCE_BACKOFF_MS = '50';
+process.env.WAGER_REFERENCE_POLL_MS = '10';
 
 describe('Wagering HTTP API (e2e)', () => {
   let app: INestApplication<App>;
@@ -276,4 +281,179 @@ describe('Wagering HTTP API (e2e)', () => {
       .expect(400);
     expect(missingKey.body.code).toBe('IDEMPOTENCY_KEY_REQUIRED');
   });
+
+  it('reprocesses a pending transaction when its reference arrives later', async () => {
+    const playerId = `api-late-reference-${crypto.randomUUID()}`;
+    const wallet = await request(app.getHttpServer())
+      .post('/wallets')
+      .send({
+        playerId,
+        initialBalance: { amount: '100.00', currency: 'BRL' },
+      })
+      .expect(201);
+    const providerId = `provider-${crypto.randomUUID()}`;
+    const betId = `late-bet-${crypto.randomUUID()}`;
+    const win = await request(app.getHttpServer())
+      .post('/wagering/transactions')
+      .set('Idempotency-Key', `late-win-${crypto.randomUUID()}`)
+      .send({
+        providerId,
+        externalTransactionId: `late-win-${crypto.randomUUID()}`,
+        playerId,
+        walletId: wallet.body.id as string,
+        roundId: 'round-late-reference',
+        gameId: 'game-late-reference',
+        kind: 'WIN',
+        money: { amount: '25.00', currency: 'BRL' },
+        referenceExternalTransactionId: betId,
+      })
+      .expect(202);
+
+    expect(win.body.status).toBe('PENDING_REFERENCE');
+    expect(win.body.referenceAttempts).toBe(0);
+    expect(win.body.nextReferenceAttemptAt).toEqual(expect.any(String));
+
+    const rollback = await request(app.getHttpServer())
+      .post('/wagering/transactions')
+      .set('Idempotency-Key', `late-rollback-${crypto.randomUUID()}`)
+      .send({
+        providerId,
+        externalTransactionId: `late-rollback-${crypto.randomUUID()}`,
+        playerId,
+        walletId: wallet.body.id as string,
+        roundId: 'round-late-reference',
+        gameId: 'game-late-reference',
+        kind: 'ROLLBACK',
+        money: { amount: '25.00', currency: 'BRL' },
+        referenceExternalTransactionId: win.body.externalTransactionId,
+      })
+      .expect(202);
+    expect(rollback.body.status).toBe('PENDING_REFERENCE');
+
+    await request(app.getHttpServer())
+      .post('/wagering/transactions')
+      .set('Idempotency-Key', `late-bet-${crypto.randomUUID()}`)
+      .send({
+        providerId,
+        externalTransactionId: betId,
+        playerId,
+        walletId: wallet.body.id,
+        roundId: 'round-late-reference',
+        gameId: 'game-late-reference',
+        kind: 'BET',
+        money: { amount: '40.00', currency: 'BRL' },
+      })
+      .expect(200);
+
+    const processed = await waitForTransactionStatus(
+      app,
+      win.body.id as string,
+      'PROCESSED',
+    );
+    expect(processed.failureCode).toBeNull();
+    expect(processed.referenceAttempts).toBeGreaterThanOrEqual(1);
+    expect(processed.nextReferenceAttemptAt).toBeNull();
+    expect(processed.balance).toEqual({ amount: '85.00', currency: 'BRL' });
+
+    const processedRollback = await waitForTransactionStatus(
+      app,
+      rollback.body.id as string,
+      'PROCESSED',
+    );
+    expect(processedRollback.balance).toEqual({
+      amount: '60.00',
+      currency: 'BRL',
+    });
+
+    const reconciliation = await request(app.getHttpServer())
+      .post(`/wallets/${wallet.body.id}/reconciliation`)
+      .expect(200);
+    expect(reconciliation.body.consistent).toBe(true);
+
+    const outboxEvents = await app
+      .get(MikroORM)
+      .em.execute<{ event_type: string }[]>(
+        `select event_type from outbox_messages
+         where aggregate_id = ?`,
+        [wallet.body.id],
+      );
+    expect(outboxEvents.map(({ event_type }) => event_type)).toContain(
+      'WagerTransactionProcessed',
+    );
+  });
+
+  it('audits and rejects a missing reference after the configured retry limit', async () => {
+    const playerId = `api-reference-exhausted-${crypto.randomUUID()}`;
+    const wallet = await request(app.getHttpServer())
+      .post('/wallets')
+      .send({
+        playerId,
+        initialBalance: { amount: '0.00', currency: 'BRL' },
+      })
+      .expect(201);
+    const pending = await request(app.getHttpServer())
+      .post('/wagering/transactions')
+      .set('Idempotency-Key', `exhaust-${crypto.randomUUID()}`)
+      .send({
+        providerId: `provider-${crypto.randomUUID()}`,
+        externalTransactionId: `missing-win-${crypto.randomUUID()}`,
+        playerId,
+        walletId: wallet.body.id,
+        roundId: 'round-exhausted-reference',
+        gameId: 'game-exhausted-reference',
+        kind: 'WIN',
+        money: { amount: '5.00', currency: 'BRL' },
+        referenceExternalTransactionId: `missing-bet-${crypto.randomUUID()}`,
+      })
+      .expect(202);
+
+    const rejected = await waitForTransactionStatus(
+      app,
+      pending.body.id as string,
+      'REJECTED',
+    );
+    expect(rejected.failureCode).toBe('REFERENCE_NOT_FOUND');
+    expect(rejected.referenceAttempts).toBe(4);
+    expect(rejected.nextReferenceAttemptAt).toBeNull();
+
+    const auditEvents = await app
+      .get(MikroORM)
+      .em.execute<{ event_type: string; rejection_reason: string }[]>(
+        `select event_type,
+           payload -> 'data' ->> 'rejectionReason' as rejection_reason
+         from outbox_messages where aggregate_id = ?
+           and event_type = 'WagerTransactionRejected'`,
+        [wallet.body.id],
+      );
+    expect(auditEvents).toEqual([
+      {
+        event_type: 'WagerTransactionRejected',
+        rejection_reason: 'REFERENCE_RETRY_EXHAUSTED',
+      },
+    ]);
+  });
 });
+
+async function waitForTransactionStatus(
+  app: INestApplication<App>,
+  transactionId: string,
+  expectedStatus: string,
+): Promise<Record<string, unknown> & {
+  failureCode: string | null;
+  referenceAttempts: number;
+  nextReferenceAttemptAt: string | null;
+}> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const response = await request(app.getHttpServer()).get(
+      `/wagering/transactions/${transactionId}`,
+    );
+    if (response.status === 200 && response.body.status === expectedStatus) {
+      return response.body;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(
+    `Transaction ${transactionId} did not reach ${expectedStatus} before timeout`,
+  );
+}

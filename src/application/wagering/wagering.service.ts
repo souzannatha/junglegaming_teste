@@ -3,6 +3,8 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  OnModuleDestroy,
+  OnModuleInit,
   UnprocessableEntityException,
 } from '@nestjs/common';
 import { Inject } from '@nestjs/common';
@@ -37,6 +39,8 @@ interface DatabaseRow {
   reference_transaction_id?: string | null;
   failure_code?: string | null;
   processed_at?: Date | string | null;
+  reference_attempts?: number | string;
+  next_reference_attempt_at?: Date | string | null;
 }
 
 interface ProcessResult {
@@ -44,22 +48,68 @@ interface ProcessResult {
   body: Record<string, unknown>;
 }
 
+interface RetryState {
+  referenceAttempts: number;
+  nextReferenceAttemptAt: Date | null;
+}
+
 const TRANSACTION_SELECT = `
   select id, provider_id, external_transaction_id, idempotency_key,
     payload_hash, wallet_id, player_id, round_id, game_id, kind, amount,
     currency, reference_external_transaction_id, reference_transaction_id,
     status, failure_code, created_at, processed_at, result_balance,
-    result_wallet_version
+    result_wallet_version, reference_attempts, next_reference_attempt_at
   from wager_transactions
 `;
 
 @Injectable()
-export class WageringService {
+export class WageringService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(WageringService.name);
+  private readonly referenceMaxAttempts = readIntegerSetting(
+    'WAGER_REFERENCE_MAX_ATTEMPTS',
+    5,
+    1,
+    100,
+  );
+  private readonly referenceBackoffMs = readIntegerSetting(
+    'WAGER_REFERENCE_BACKOFF_MS',
+    500,
+    10,
+    60_000,
+  );
+  private readonly referencePollMs = readIntegerSetting(
+    'WAGER_REFERENCE_POLL_MS',
+    250,
+    10,
+    60_000,
+  );
+  private retryTimer: ReturnType<typeof setInterval> | undefined;
+  private retryBatchRunning = false;
 
   constructor(
     @Inject(MikroORM) private readonly orm: MikroORM,
   ) {}
+
+  onModuleInit(): void {
+    this.retryTimer = setInterval(() => {
+      void this.processDueReferenceRetries().catch((error: unknown) => {
+        this.logger.error(
+          JSON.stringify({
+            event: 'reference_retry_batch_failed',
+            errorType: error instanceof Error ? error.name : 'UnknownError',
+          }),
+        );
+      });
+    }, this.referencePollMs);
+    this.retryTimer.unref();
+  }
+
+  onModuleDestroy(): void {
+    if (this.retryTimer) {
+      clearInterval(this.retryTimer);
+      this.retryTimer = undefined;
+    }
+  }
 
   async createWallet(request: CreateWalletRequest): Promise<{
     id: string;
@@ -404,20 +454,28 @@ export class WageringService {
           message: 'External transaction ID is already in use',
         });
       }
+      const referenceIsStillPending =
+        reference?.status === WagerTransactionStatus.Pending ||
+        reference?.status === WagerTransactionStatus.PendingReference;
       if (
         request.referenceExternalTransactionId !== undefined &&
-        !reference
+        (!reference || referenceIsStillPending)
       ) {
         transaction.markPendingReference();
+        const nextReferenceAttemptAt = new Date(
+          now.getTime() + this.referenceBackoffMs,
+        );
         await query(
           em,
           `update wager_transactions
-           set status = ?, result_balance = ?, result_wallet_version = ?
+           set status = ?, result_balance = ?, result_wallet_version = ?,
+             next_reference_attempt_at = ?
            where id = ?`,
           [
             transaction.status,
             wallet.balance.toString(),
             wallet.version,
+            nextReferenceAttemptAt,
             transaction.id,
           ],
         );
@@ -428,81 +486,158 @@ export class WageringService {
           occurredAt: now,
           correlationId,
           causationId: transaction.id,
-          data: transactionEventData(transaction, wallet),
+          data: {
+            ...transactionEventData(transaction, wallet),
+            referenceAttempts: 0,
+            nextReferenceAttemptAt: nextReferenceAttemptAt.toISOString(),
+          },
         });
-        return formatTransactionResult(transaction, wallet, false);
+        return formatTransactionResult(transaction, wallet, false, {
+          referenceAttempts: 0,
+          nextReferenceAttemptAt,
+        });
       }
 
-      const existingReversals = reference
-        ? await findReversals(
-            em,
-            request.providerId,
-            reference.externalTransactionId,
-          )
-        : [];
+      return processWagerTransaction(
+        em,
+        transaction,
+        wallet,
+        reference,
+        correlationId,
+        now,
+      );
+    });
+  }
 
-      try {
-        WagerRules.validateReference(
-          transaction,
-          reference,
-          existingReversals,
+  async processDueReferenceRetries(): Promise<number> {
+    if (this.retryBatchRunning) {
+      return 0;
+    }
+    this.retryBatchRunning = true;
+    try {
+      const due = await query(
+        this.orm.em,
+        `select id from wager_transactions
+         where status = 'PENDING_REFERENCE'
+           and next_reference_attempt_at <= ?
+         order by next_reference_attempt_at, created_at, id
+         limit 100`,
+        [new Date()],
+      );
+      let processed = 0;
+      for (const candidate of due) {
+        if (await this.retryReference(String(candidate.id))) {
+          processed += 1;
+        }
+      }
+      return processed;
+    } finally {
+      this.retryBatchRunning = false;
+    }
+  }
+
+  private async retryReference(transactionId: string): Promise<boolean> {
+    return this.orm.em.transactional(async (em) => {
+      const candidates = await query(
+        em,
+        `select wallet_id from wager_transactions
+         where id = ? and status = 'PENDING_REFERENCE'
+           and next_reference_attempt_at <= ?`,
+        [transactionId, new Date()],
+      );
+      const candidate = candidates[0];
+      if (!candidate) {
+        return false;
+      }
+
+      const wallets = await query(
+        em,
+        `select id, player_id, currency, balance, version, created_at,
+           updated_at
+         from wallets where id = ? for update`,
+        [String(candidate.wallet_id)],
+      );
+      const walletRow = wallets[0];
+      if (!walletRow) {
+        throw new Error(
+          `Wallet for pending-reference transaction ${transactionId} was not found`,
         );
+      }
 
-        if (transaction.kind === WagerTransactionKind.Loss) {
-          transaction.markProcessed(reference?.id, now);
-        } else {
-          const direction = transaction.ledgerDirectionFor(reference);
-          const ledger =
-            direction === LedgerDirection.Debit
-              ? wallet.debit({
-                  entryId: randomUUID(),
-                  transactionId: transaction.id,
-                  amount: transaction.money,
-                  at: now,
-                  insufficientFundsCode:
-                    transaction.insufficientFundsFailureCode(),
-                })
-              : wallet.credit({
-                  entryId: randomUUID(),
-                  transactionId: transaction.id,
-                  amount: transaction.money,
-                  at: now,
-                });
-          transaction.markProcessed(reference?.id, now);
+      const transactions = await query(
+        em,
+        `${TRANSACTION_SELECT}
+         where id = ? and status = 'PENDING_REFERENCE'
+           and next_reference_attempt_at <= ?
+         for update`,
+        [transactionId, new Date()],
+      );
+      const row = transactions[0];
+      if (!row) {
+        return false;
+      }
 
+      const now = new Date();
+      const transaction = hydrateTransaction(row);
+      const wallet = hydrateWallet(walletRow);
+      const reference = transaction.referenceExternalTransactionId
+        ? await findReference(
+            em,
+            transaction.providerId,
+            transaction.referenceExternalTransactionId,
+          )
+        : undefined;
+      const referenceAttempts = Number(row.reference_attempts ?? 0) + 1;
+      const correlationId = randomUUID();
+
+      if (
+        !reference ||
+        reference.status !== WagerTransactionStatus.Processed
+      ) {
+        const retryable =
+          !reference ||
+          reference.status === WagerTransactionStatus.Pending ||
+          reference.status === WagerTransactionStatus.PendingReference;
+        const failureCode = reference
+          ? WagerFailureCode.ReferenceNotProcessed
+          : WagerFailureCode.ReferenceNotFound;
+
+        if (retryable && referenceAttempts < this.referenceMaxAttempts) {
+          const delayMs = referenceRetryDelay(
+            this.referenceBackoffMs,
+            referenceAttempts,
+          );
+          const nextReferenceAttemptAt = new Date(now.getTime() + delayMs);
           await query(
             em,
-            `update wallets
-             set balance = ?, version = ?, updated_at = ?
+            `update wager_transactions
+             set reference_attempts = ?, next_reference_attempt_at = ?
              where id = ?`,
-            [
-              wallet.balance.toString(),
-              wallet.version,
-              wallet.updatedAt,
-              wallet.id,
-            ],
+            [referenceAttempts, nextReferenceAttemptAt, transaction.id],
           );
-          await insertLedgerEntry(em, ledger, wallet.version);
+          await insertOutboxEvent(em, {
+            id: randomUUID(),
+            aggregateId: wallet.id,
+            eventType: 'WagerTransactionReferenceRetryScheduled',
+            occurredAt: now,
+            correlationId,
+            causationId: transaction.id,
+            data: {
+              ...transactionEventData(transaction, wallet),
+              referenceAttempts,
+              maxReferenceAttempts: this.referenceMaxAttempts,
+              failureCode,
+              nextReferenceAttemptAt: nextReferenceAttemptAt.toISOString(),
+            },
+          });
+          return true;
         }
 
-        await updateTransactionResult(em, transaction, wallet, now);
-        await insertOutboxEvent(em, {
-          id: randomUUID(),
-          aggregateId: wallet.id,
-          eventType: 'WagerTransactionProcessed',
-          occurredAt: now,
-          correlationId,
-          causationId: transaction.id,
-          data: transactionEventData(transaction, wallet),
+        transaction.reject(failureCode);
+        await updateTransactionResult(em, transaction, wallet, now, {
+          referenceAttempts,
+          nextReferenceAttemptAt: null,
         });
-        return formatTransactionResult(transaction, wallet, false);
-      } catch (error) {
-        if (!(error instanceof WagerRuleViolationError)) {
-          throw error;
-        }
-
-        transaction.reject(error.failureCode);
-        await updateTransactionResult(em, transaction, wallet, now);
         await insertOutboxEvent(em, {
           id: randomUUID(),
           aggregateId: wallet.id,
@@ -512,11 +647,29 @@ export class WageringService {
           causationId: transaction.id,
           data: {
             ...transactionEventData(transaction, wallet),
-            failureCode: transaction.failureCode,
+            failureCode,
+            referenceAttempts,
+            maxReferenceAttempts: this.referenceMaxAttempts,
+            rejectionReason: 'REFERENCE_RETRY_EXHAUSTED',
           },
         });
-        return formatTransactionResult(transaction, wallet, false);
+        return true;
       }
+
+      transaction.markPending();
+      await processWagerTransaction(
+        em,
+        transaction,
+        wallet,
+        reference,
+        correlationId,
+        now,
+        {
+          referenceAttempts,
+          nextReferenceAttemptAt: null,
+        },
+      );
+      return true;
     });
   }
 
@@ -607,6 +760,99 @@ export class WageringService {
         checkedAt: new Date().toISOString(),
       };
     });
+  }
+}
+
+async function processWagerTransaction(
+  em: EntityManager,
+  transaction: WagerTransaction,
+  wallet: Wallet,
+  reference: WagerTransaction | undefined,
+  correlationId: string,
+  now: Date,
+  retryState: RetryState = {
+    referenceAttempts: 0,
+    nextReferenceAttemptAt: null,
+  },
+): Promise<ProcessResult> {
+  const existingReversals = reference
+    ? await findReversals(
+        em,
+        transaction.providerId,
+        reference.externalTransactionId,
+      )
+    : [];
+
+  try {
+    WagerRules.validateReference(transaction, reference, existingReversals);
+
+    if (transaction.kind === WagerTransactionKind.Loss) {
+      transaction.markProcessed(reference?.id, now);
+    } else {
+      const direction = transaction.ledgerDirectionFor(reference);
+      const ledger =
+        direction === LedgerDirection.Debit
+          ? wallet.debit({
+              entryId: randomUUID(),
+              transactionId: transaction.id,
+              amount: transaction.money,
+              at: now,
+              insufficientFundsCode:
+                transaction.insufficientFundsFailureCode(),
+            })
+          : wallet.credit({
+              entryId: randomUUID(),
+              transactionId: transaction.id,
+              amount: transaction.money,
+              at: now,
+            });
+      transaction.markProcessed(reference?.id, now);
+
+      await query(
+        em,
+        `update wallets
+         set balance = ?, version = ?, updated_at = ?
+         where id = ?`,
+        [wallet.balance.toString(), wallet.version, wallet.updatedAt, wallet.id],
+      );
+      await insertLedgerEntry(em, ledger, wallet.version);
+    }
+
+    await updateTransactionResult(em, transaction, wallet, now, retryState);
+    await insertOutboxEvent(em, {
+      id: randomUUID(),
+      aggregateId: wallet.id,
+      eventType: 'WagerTransactionProcessed',
+      occurredAt: now,
+      correlationId,
+      causationId: transaction.id,
+      data: {
+        ...transactionEventData(transaction, wallet),
+        referenceAttempts: retryState.referenceAttempts,
+      },
+    });
+    return formatTransactionResult(transaction, wallet, false, retryState);
+  } catch (error) {
+    if (!(error instanceof WagerRuleViolationError)) {
+      throw error;
+    }
+
+    transaction.reject(error.failureCode);
+    await updateTransactionResult(em, transaction, wallet, now, retryState);
+    await insertOutboxEvent(em, {
+      id: randomUUID(),
+      aggregateId: wallet.id,
+      eventType: 'WagerTransactionRejected',
+      occurredAt: now,
+      correlationId,
+      causationId: transaction.id,
+      data: {
+        ...transactionEventData(transaction, wallet),
+        failureCode: transaction.failureCode,
+        referenceAttempts: retryState.referenceAttempts,
+      },
+    });
+    return formatTransactionResult(transaction, wallet, false, retryState);
   }
 }
 
@@ -722,12 +968,17 @@ async function updateTransactionResult(
   transaction: WagerTransaction,
   wallet: Wallet,
   processedAt: Date,
+  retryState: RetryState = {
+    referenceAttempts: 0,
+    nextReferenceAttemptAt: null,
+  },
 ): Promise<void> {
   await query(
     em,
     `update wager_transactions
      set status = ?, failure_code = ?, reference_transaction_id = ?,
-       processed_at = ?, result_balance = ?, result_wallet_version = ?
+       processed_at = ?, result_balance = ?, result_wallet_version = ?,
+       reference_attempts = ?, next_reference_attempt_at = ?
      where id = ?`,
     [
       transaction.status,
@@ -738,6 +989,8 @@ async function updateTransactionResult(
         : null,
       wallet.balance.toString(),
       wallet.version,
+      retryState.referenceAttempts,
+      retryState.nextReferenceAttemptAt,
       transaction.id,
     ],
   );
@@ -919,6 +1172,10 @@ function formatTransactionResult(
   transaction: WagerTransaction,
   wallet: Wallet,
   idempotentReplay: boolean,
+  retryState: RetryState = {
+    referenceAttempts: 0,
+    nextReferenceAttemptAt: null,
+  },
 ): ProcessResult {
   return {
     httpStatus: statusCode(transaction.status),
@@ -932,6 +1189,9 @@ function formatTransactionResult(
       balance: wallet.balance.toJSON(),
       walletVersion: wallet.version,
       idempotentReplay,
+      referenceAttempts: retryState.referenceAttempts,
+      nextReferenceAttemptAt:
+        retryState.nextReferenceAttemptAt?.toISOString() ?? null,
     },
   };
 }
@@ -1029,6 +1289,12 @@ function serializeTransaction(
     status: String(row.status),
     failureCode:
       row.failure_code === null ? null : String(row.failure_code),
+    referenceAttempts: Number(row.reference_attempts ?? 0),
+    nextReferenceAttemptAt:
+      row.next_reference_attempt_at === null ||
+      row.next_reference_attempt_at === undefined
+        ? null
+        : new Date(String(row.next_reference_attempt_at)).toISOString(),
     processedAt:
       row.processed_at === null
         ? null
@@ -1074,4 +1340,29 @@ function decodeCursor(cursor: string): { createdAt: string; id: string } {
       message: 'cursor is invalid',
     });
   }
+}
+
+function readIntegerSetting(
+  name: string,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.length === 0) {
+    return fallback;
+  }
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
+  }
+  return value;
+}
+
+function referenceRetryDelay(baseDelayMs: number, attempt: number): number {
+  const exponent = Math.min(30, Math.max(0, attempt - 1));
+  return Math.min(60_000, baseDelayMs * 2 ** exponent);
 }

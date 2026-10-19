@@ -56,6 +56,12 @@ Todos os valores monetários são enviados como strings decimais com duas casas 
 
 O processamento bloqueia a carteira dentro de uma transação PostgreSQL e confirma saldo, versão, transação, ledger e outbox atomicamente. Repetições idempotentes retornam o snapshot de saldo e versão registrados na operação original; uma mesma chave com payload diferente resulta em `409`. Transações processadas retornam `200`, referências ainda ausentes retornam `202`, rejeições de negócio persistidas retornam `422`, e entradas inválidas retornam `400`. A API gera ou propaga um `X-Correlation-Id` validado nos eventos de outbox.
 
+## Referências fora de ordem
+
+Uma transação que declara uma referência ainda ausente é persistida em `PENDING_REFERENCE`, mantendo o snapshot original de resposta e criando um evento de outbox. O worker periódico consulta tentativas vencidas no PostgreSQL, bloqueia a carteira e a transação em uma transação única, e reavalia a referência antes de qualquer débito/crédito. A operação financeira, o ledger, o estado terminal, o snapshot e o evento de resultado são gravados atomicamente; tentativas concorrentes ou réplicas do serviço revalidam o estado após adquirir os mesmos locks.
+
+Falhas temporárias são reagendadas com backoff exponencial limitado a 60 segundos. Ao exceder `WAGER_REFERENCE_MAX_ATTEMPTS`, a transação passa a `REJECTED` com `REFERENCE_NOT_FOUND` ou `REFERENCE_NOT_PROCESSED`; esse estado e o evento `WagerTransactionRejected` registram a quantidade de tentativas e o motivo de esgotamento. Violações definitivas de referência são rejeitadas assim que a referência pode ser avaliada. O evento `WagerTransactionReferenceRetryScheduled` registra cada reagendamento. As configurações padrão são 5 tentativas, 500 ms de backoff inicial e polling a cada 250 ms; configure `WAGER_REFERENCE_MAX_ATTEMPTS` (1–100), `WAGER_REFERENCE_BACKOFF_MS` e `WAGER_REFERENCE_POLL_MS` (10–60000 ms) no ambiente.
+
 ## Verificações
 
 ```sh
