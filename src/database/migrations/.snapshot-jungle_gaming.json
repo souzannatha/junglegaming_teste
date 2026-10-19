@@ -599,6 +599,40 @@
           "enumItems": [],
           "mappedType": "string"
         },
+        "result_balance": {
+          "name": "result_balance",
+          "type": "numeric(10,0)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "decimal"
+        },
+        "result_wallet_version": {
+          "name": "result_wallet_version",
+          "type": "int",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "integer"
+        },
         "round_id": {
           "name": "round_id",
           "type": "varchar(128)",
@@ -799,6 +833,18 @@
           "columnName": "kind"
         },
         {
+          "name": "wager_transactions_result_balance_ck",
+          "expression": "(result_balance IS NULL) OR ((result_balance >= 0) AND (result_balance = round(result_balance, 2)))",
+          "definition": "CHECK (((result_balance IS NULL) OR ((result_balance >= (0)::numeric) AND (result_balance = round(result_balance, 2)))))",
+          "columnName": "result_balance"
+        },
+        {
+          "name": "wager_transactions_result_version_ck",
+          "expression": "(result_wallet_version IS NULL) OR (result_wallet_version >= 1)",
+          "definition": "CHECK (((result_wallet_version IS NULL) OR (result_wallet_version >= 1)))",
+          "columnName": "result_wallet_version"
+        },
+        {
           "name": "wager_transactions_status_ck",
           "expression": "\"status\" in ('PENDING', 'PENDING_REFERENCE', 'PROCESSED', 'REJECTED', 'FAILED')",
           "definition": "check (\"status\" in ('PENDING', 'PENDING_REFERENCE', 'PROCESSED', 'REJECTED', 'FAILED'))",
@@ -817,6 +863,15 @@
           "timing": "after",
           "events": [
             "insert",
+            "update"
+          ],
+          "forEach": "row",
+          "body": ""
+        },
+        {
+          "name": "wager_result_snapshot_immutable",
+          "timing": "before",
+          "events": [
             "update"
           ],
           "forEach": "row",

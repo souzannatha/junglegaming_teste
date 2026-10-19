@@ -49,6 +49,15 @@ const WagerTransactionSchema = defineEntity({
         .nullable(),
     status: p.enum(Object.values(WagerTransactionStatusEntity)),
     failureCode: p.string().length(64).fieldName('failure_code').nullable(),
+    resultBalance: p
+      .decimal('string')
+      .fieldName('result_balance')
+      .columnType('numeric')
+      .nullable(),
+    resultWalletVersion: p
+      .integer()
+      .fieldName('result_wallet_version')
+      .nullable(),
     createdAt: p.datetime().fieldName('created_at'),
     processedAt: p.datetime().fieldName('processed_at').nullable(),
   },

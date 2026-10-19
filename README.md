@@ -43,6 +43,19 @@ O schema financeiro usa `NUMERIC` do PostgreSQL sem converter valores para ponto
 
 Códigos estáveis de rejeição definidos no domínio: `INSUFFICIENT_FUNDS`, `REVERSAL_INSUFFICIENT_FUNDS`, `REFERENCE_NOT_FOUND`, `REFERENCE_NOT_PROCESSED`, `REFERENCE_TYPE_NOT_ALLOWED`, `REFERENCE_CONTEXT_MISMATCH`, `REFERENCE_AMOUNT_MISMATCH` e `REFERENCE_ALREADY_REVERSED`.
 
+## API HTTP
+
+Todos os valores monetários são enviados como strings decimais com duas casas e moeda explícita. Por exemplo: `"money": {"amount": "12.50", "currency": "BRL"}`. Valores em JSON numérico não são aceitos.
+
+- `POST /wallets` cria uma carteira a partir de `{ "playerId": "...", "initialBalance": { "amount": "100.00", "currency": "BRL" } }`. Um saldo inicial positivo cria atomicamente a transação interna `OPENING` e o lançamento correspondente.
+- `GET /wallets/:walletId` consulta o saldo e a versão atuais.
+- `GET /wallets/:walletId/ledger?cursor=...&limit=50` lista lançamentos em ordem decrescente com cursor opaco; o limite permitido é de 1 a 100.
+- `POST /wagering/transactions` exige o header `Idempotency-Key`. O corpo contém `providerId`, `externalTransactionId`, `playerId`, `walletId`, `roundId`, `gameId`, `kind`, `money` e, para transações referenciadas, `referenceExternalTransactionId`.
+- `GET /wagering/transactions/:transactionId` e `GET /providers/:providerId/wagering/transactions/:externalTransactionId` consultam transações.
+- `POST /wallets/:walletId/reconciliation` compara saldo/versão armazenados com os valores reconstruídos do ledger.
+
+O processamento bloqueia a carteira dentro de uma transação PostgreSQL e confirma saldo, versão, transação, ledger e outbox atomicamente. Repetições idempotentes retornam o snapshot de saldo e versão registrados na operação original; uma mesma chave com payload diferente resulta em `409`. Transações processadas retornam `200`, referências ainda ausentes retornam `202`, rejeições de negócio persistidas retornam `422`, e entradas inválidas retornam `400`. A API gera ou propaga um `X-Correlation-Id` validado nos eventos de outbox.
+
 ## Verificações
 
 ```sh
