@@ -11,6 +11,7 @@ import {
   WageringTransactionsController,
 } from './api/wallets.controller.js';
 import { WageringService } from './application/wagering/wagering.service.js';
+import { OutboxPublisher } from './infrastructure/outbox/outbox-publisher.service.js';
 
 @Module({
   imports: [MikroOrmModule.forRoot(mikroOrmConfig)],
@@ -23,6 +24,7 @@ import { WageringService } from './application/wagering/wagering.service.js';
   providers: [
     AppService,
     WageringService,
+    OutboxPublisher,
     { provide: APP_FILTER, useClass: DomainExceptionFilter },
   ],
 })

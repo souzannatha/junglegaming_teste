@@ -17,11 +17,19 @@ const OutboxSchema = defineEntity({
     attempts: p.integer().default(0),
     nextAttemptAt: p.datetime().fieldName('next_attempt_at').nullable(),
     publishedAt: p.datetime().fieldName('published_at').nullable(),
+    leaseToken: p.string().length(64).fieldName('lease_token').nullable(),
+    leaseUntil: p.datetime().fieldName('lease_until').nullable(),
+    lastError: p.string().length(128).fieldName('last_error').nullable(),
   },
   indexes: [
     {
       properties: ['nextAttemptAt', 'occurredAt'],
       name: 'outbox_messages_due_idx',
+      where: 'published_at IS NULL',
+    },
+    {
+      properties: ['leaseUntil', 'nextAttemptAt', 'occurredAt'],
+      name: 'outbox_messages_claim_idx',
       where: 'published_at IS NULL',
     },
   ],

@@ -62,6 +62,12 @@ Uma transação que declara uma referência ainda ausente é persistida em `PEND
 
 Falhas temporárias são reagendadas com backoff exponencial limitado a 60 segundos. Ao exceder `WAGER_REFERENCE_MAX_ATTEMPTS`, a transação passa a `REJECTED` com `REFERENCE_NOT_FOUND` ou `REFERENCE_NOT_PROCESSED`; esse estado e o evento `WagerTransactionRejected` registram a quantidade de tentativas e o motivo de esgotamento. Violações definitivas de referência são rejeitadas assim que a referência pode ser avaliada. O evento `WagerTransactionReferenceRetryScheduled` registra cada reagendamento. As configurações padrão são 5 tentativas, 500 ms de backoff inicial e polling a cada 250 ms; configure `WAGER_REFERENCE_MAX_ATTEMPTS` (1–100), `WAGER_REFERENCE_BACKOFF_MS` e `WAGER_REFERENCE_POLL_MS` (10–60000 ms) no ambiente.
 
+## Eventos e Transactional Outbox
+
+Cada alteração financeira grava seu envelope de evento versionado na tabela `outbox_messages` dentro da mesma transação PostgreSQL da carteira, transação de wagering e ledger. Um publisher periódico reivindica lotes com `FOR UPDATE SKIP LOCKED`, lease com expiração e envio concorrente sem manter locks do banco durante chamadas SQS. Após o envio, o evento é marcado como publicado; falhas liberam o lease e agendam nova tentativa com backoff exponencial limitado. Se o processo cair após SQS aceitar a mensagem e antes do ack PostgreSQL, o lease expira e a mensagem pode ser entregue novamente: a garantia é **at-least-once**, e o consumidor deve deduplicar pelo `eventId`.
+
+No ambiente local, o publisher cria a fila standard `wagering-events` no LocalStack se ela não existir. Em produção, configure `AWS_REGION` e `OUTBOX_QUEUE_URL` ou `OUTBOX_QUEUE_NAME`, usando as credenciais fornecidas pela cadeia padrão do SDK; `SQS_ENDPOINT` é opcional e deve apontar para LocalStack em desenvolvimento. `OUTBOX_PUBLISHER_ENABLED=false` pausa o worker. Os limites de polling, tamanho de lote, concorrência, lease e backoff podem ser ajustados pelas variáveis `OUTBOX_PUBLISHER_*` em `.env.example`.
+
 ## Verificações
 
 ```sh

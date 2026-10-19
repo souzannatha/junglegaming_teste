@@ -211,6 +211,57 @@
           "enumItems": [],
           "mappedType": "string"
         },
+        "last_error": {
+          "name": "last_error",
+          "type": "varchar(128)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 128,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "string"
+        },
+        "lease_token": {
+          "name": "lease_token",
+          "type": "varchar(64)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 64,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "string"
+        },
+        "lease_until": {
+          "name": "lease_until",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
         "next_attempt_at": {
           "name": "next_attempt_at",
           "type": "timestamptz(6)",
@@ -283,6 +334,20 @@
       "indexes": [
         {
           "columnNames": [
+            "lease_until",
+            "next_attempt_at",
+            "occurred_at",
+            "id"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "outbox_messages_claim_idx",
+          "primary": false,
+          "unique": false,
+          "where": "published_at IS NULL"
+        },
+        {
+          "columnNames": [
             "next_attempt_at",
             "occurred_at",
             "id"
@@ -321,6 +386,12 @@
           "expression": "attempts >= 0",
           "definition": "CHECK ((attempts >= 0))",
           "columnName": "attempts"
+        },
+        {
+          "name": "outbox_messages_lease_pair_ck",
+          "expression": "(lease_token IS NULL) = (lease_until IS NULL)",
+          "definition": "CHECK (((lease_token IS NULL) = (lease_until IS NULL)))",
+          "columnName": "lease_token"
         },
         {
           "name": "outbox_messages_payload_object_ck",

@@ -8,6 +8,7 @@ import { MikroORM } from '@mikro-orm/core';
 process.env.WAGER_REFERENCE_MAX_ATTEMPTS = '4';
 process.env.WAGER_REFERENCE_BACKOFF_MS = '50';
 process.env.WAGER_REFERENCE_POLL_MS = '10';
+process.env.OUTBOX_PUBLISHER_ENABLED = 'false';
 
 describe('Wagering HTTP API (e2e)', () => {
   let app: INestApplication<App>;
@@ -370,12 +371,14 @@ describe('Wagering HTTP API (e2e)', () => {
       .expect(200);
     expect(reconciliation.body.consistent).toBe(true);
 
-    const outboxEvents = await app
+    const outboxEvents: { event_type: string }[] = await app
       .get(MikroORM)
-      .em.execute<{ event_type: string }[]>(
+      .em.getConnection()
+      .execute<{ event_type: string }>(
         `select event_type from outbox_messages
          where aggregate_id = ?`,
         [wallet.body.id],
+        'all',
       );
     expect(outboxEvents.map(({ event_type }) => event_type)).toContain(
       'WagerTransactionProcessed',
@@ -416,14 +419,19 @@ describe('Wagering HTTP API (e2e)', () => {
     expect(rejected.referenceAttempts).toBe(4);
     expect(rejected.nextReferenceAttemptAt).toBeNull();
 
-    const auditEvents = await app
+    const auditEvents: {
+      event_type: string;
+      rejection_reason: string;
+    }[] = await app
       .get(MikroORM)
-      .em.execute<{ event_type: string; rejection_reason: string }[]>(
+      .em.getConnection()
+      .execute<{ event_type: string; rejection_reason: string }>(
         `select event_type,
            payload -> 'data' ->> 'rejectionReason' as rejection_reason
          from outbox_messages where aggregate_id = ?
            and event_type = 'WagerTransactionRejected'`,
         [wallet.body.id],
+        'all',
       );
     expect(auditEvents).toEqual([
       {
