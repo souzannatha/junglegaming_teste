@@ -16,11 +16,15 @@ import {
   Logger,
   OnModuleDestroy,
   OnModuleInit,
+  Optional,
 } from '@nestjs/common';
+import { Inject } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { WageringService } from '../../application/wagering/wagering.service.js';
 import { parseSqsWagerCommand } from '../../application/wagering/wagering.contracts.js';
 import { IdempotencyConflictError } from '../../domain/errors/domain.error.js';
+import { MetricsService } from '../../observability/metrics.service.js';
+import { WorkerHealthService } from '../../observability/worker-health.service.js';
 
 @Injectable()
 export class WageringSqsConsumer implements OnModuleInit, OnModuleDestroy {
@@ -76,7 +80,15 @@ export class WageringSqsConsumer implements OnModuleInit, OnModuleDestroy {
   private polling = false;
   private pollTask: Promise<void> | undefined;
 
-  constructor(private readonly wageringService: WageringService) {
+  constructor(
+    private readonly wageringService: WageringService,
+    @Optional()
+    @Inject(MetricsService)
+    private readonly metrics?: MetricsService,
+    @Optional()
+    @Inject(WorkerHealthService)
+    private readonly workerHealth?: WorkerHealthService,
+  ) {
     if (!this.queueName.endsWith('.fifo')) {
       throw new Error('WAGERING_QUEUE_NAME must end with .fifo');
     }
@@ -102,10 +114,12 @@ export class WageringSqsConsumer implements OnModuleInit, OnModuleDestroy {
 
   onModuleInit(): void {
     if (!this.enabled) {
+      this.workerHealth?.setState('wagering-sqs-consumer', 'disabled');
       this.logger.log('Wagering SQS consumer is disabled by configuration');
       return;
     }
 
+    this.workerHealth?.setState('wagering-sqs-consumer', 'starting');
     this.polling = true;
     this.pollTask = this.pollLoop();
   }
@@ -133,6 +147,7 @@ export class WageringSqsConsumer implements OnModuleInit, OnModuleDestroy {
           }),
           { abortSignal: this.abortController.signal },
         );
+        this.workerHealth?.setState('wagering-sqs-consumer', 'ready');
 
         for (const message of received.Messages ?? []) {
           const continueBatch = await this.handleMessage(
@@ -148,6 +163,7 @@ export class WageringSqsConsumer implements OnModuleInit, OnModuleDestroy {
         if (!this.polling) {
           break;
         }
+        this.workerHealth?.setState('wagering-sqs-consumer', 'unavailable');
         this.logger.error(
           JSON.stringify({
             event: 'wagering_sqs_poll_failed',
@@ -294,7 +310,7 @@ export class WageringSqsConsumer implements OnModuleInit, OnModuleDestroy {
         });
       }
       const command = parseSqsWagerCommand(body);
-      await this.wageringService.submitWager(
+      const result = await this.wageringService.submitWager(
         command.transaction,
         command.idempotencyKey,
         command.correlationId ?? randomUUID(),
@@ -303,8 +319,16 @@ export class WageringSqsConsumer implements OnModuleInit, OnModuleDestroy {
           messageId: message.MessageId,
         },
       );
+      this.metrics?.record(
+        'wagering_sqs_messages_total',
+        result.body.duplicateMessage === true ||
+          result.body.idempotentReplay === true
+          ? 'duplicate'
+          : 'processed',
+      );
     } catch (error) {
       if (!isPermanentError(error)) {
+        this.metrics?.record('wagering_sqs_messages_total', 'retry');
         this.logger.warn(
           JSON.stringify({
             event: 'wagering_sqs_message_retry_scheduled',
@@ -313,12 +337,14 @@ export class WageringSqsConsumer implements OnModuleInit, OnModuleDestroy {
             errorType: errorName(error),
           }),
         );
+        this.metrics?.record('wagering_sqs_messages_total', 'dead_lettered');
         return false;
       }
 
       try {
         await this.sendToDeadLetterQueue(message, deadLetterQueueUrl, error);
       } catch (deadLetterError) {
+        this.workerHealth?.setState('wagering-sqs-consumer', 'unavailable');
         this.logger.error(
           JSON.stringify({
             event: 'wagering_sqs_dead_letter_publish_failed',
@@ -347,6 +373,8 @@ export class WageringSqsConsumer implements OnModuleInit, OnModuleDestroy {
       );
       return true;
     } catch (error) {
+      this.workerHealth?.setState('wagering-sqs-consumer', 'unavailable');
+      this.metrics?.record('wagering_sqs_messages_total', 'ack_failed');
       this.logger.warn(
         JSON.stringify({
           event: 'wagering_sqs_message_ack_failed',

@@ -95,10 +95,19 @@ Produtores devem definir `MessageGroupId` de forma estável por carteira (por ex
 
 O consumidor executa o mesmo caso de uso financeiro da API. O registro de inbox, a transação de wagering, o ledger e a outbox são confirmados atomicamente no PostgreSQL; a mensagem só é removida do SQS após o commit. Redeliveries são deduplicadas por `(consumerName, messageId)` na inbox e pela chave de idempotência do provedor. Erros permanentes de contrato/conflito são encaminhados à DLQ antes do ack; erros transitórios permanecem sem ack para retry e redrive. Rejeições de negócio persistidas são consideradas processadas e podem ser confirmadas. No encerramento, o consumidor aborta o long poll e aguarda o processamento ativo. `WAGERING_SQS_CONSUMER_ENABLED=false` pausa a entrada; nomes, visibilidade, long poll, tamanho do lote e redrive são configuráveis pelas variáveis `WAGERING_*` em `.env.example`.
 
+## Observabilidade e validação
+
+- `GET /health/live`: liveness do processo, sem dependências externas.
+- `GET /health/ready`: verifica PostgreSQL e disponibilidade dos workers habilitados; responde `503` enquanto um worker está iniciando ou indisponível.
+- `GET /metrics`: métricas Prometheus de requisições HTTP, duração e requisições em andamento, publicações da outbox, retries de referências, resultados do consumidor SQS e reconciliações. As métricas são locais ao processo e não incluem payloads ou valores financeiros; configure o scraper para coletar cada instância.
+
+As decisões, garantias, operação de filas, limites conhecidos e ausência de autenticação estão descritas em [ARCHITECTURE.md](./ARCHITECTURE.md).
+
 ## Verificações
 
 ```sh
 bun run build
+bun run typecheck
 bun run test
 bun run test:e2e
 bun run lint

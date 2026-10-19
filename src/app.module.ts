@@ -1,9 +1,9 @@
 import { Module } from '@nestjs/common';
 import { MikroOrmModule } from '@mikro-orm/nestjs';
+import { APP_FILTER } from '@nestjs/core';
 import mikroOrmConfig from './database/mikro-orm.config.js';
 import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
-import { APP_FILTER } from '@nestjs/core';
 import { DomainExceptionFilter } from './api/domain-exception.filter.js';
 import {
   ProviderWageringTransactionsController,
@@ -13,6 +13,13 @@ import {
 import { WageringService } from './application/wagering/wagering.service.js';
 import { OutboxPublisher } from './infrastructure/outbox/outbox-publisher.service.js';
 import { WageringSqsConsumer } from './infrastructure/sqs/wagering-sqs-consumer.service.js';
+import {
+  HealthController,
+  MetricsController,
+  ReadinessService,
+} from './observability/observability.controller.js';
+import { MetricsService } from './observability/metrics.service.js';
+import { WorkerHealthService } from './observability/worker-health.service.js';
 
 @Module({
   imports: [MikroOrmModule.forRoot(mikroOrmConfig)],
@@ -21,9 +28,14 @@ import { WageringSqsConsumer } from './infrastructure/sqs/wagering-sqs-consumer.
     WalletsController,
     WageringTransactionsController,
     ProviderWageringTransactionsController,
+    HealthController,
+    MetricsController,
   ],
   providers: [
     AppService,
+    MetricsService,
+    WorkerHealthService,
+    ReadinessService,
     WageringService,
     OutboxPublisher,
     WageringSqsConsumer,

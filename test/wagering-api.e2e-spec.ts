@@ -149,9 +149,7 @@ describe('Wagering HTTP API (e2e)', () => {
         externalTransactionId: `refund-duplicate-${crypto.randomUUID()}`,
       })
       .expect(422);
-    expect(duplicateRefund.body.failureCode).toBe(
-      'REFERENCE_ALREADY_REVERSED',
-    );
+    expect(duplicateRefund.body.failureCode).toBe('REFERENCE_ALREADY_REVERSED');
 
     const delayedBetReplay = await request(app.getHttpServer())
       .post('/wagering/transactions')
@@ -246,6 +244,60 @@ describe('Wagering HTTP API (e2e)', () => {
       .post(`/wallets/${wallet.body.id}/reconciliation`)
       .expect(200);
     expect(reconciliation.body.consistent).toBe(true);
+  });
+
+  it('preserves wallet invariants across separate application instances', async () => {
+    const secondModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+    const secondApp = secondModule.createNestApplication();
+    await secondApp.init();
+
+    try {
+      const playerId = `api-multi-instance-${crypto.randomUUID()}`;
+      const wallet = await request(app.getHttpServer())
+        .post('/wallets')
+        .send({
+          playerId,
+          initialBalance: { amount: '100.00', currency: 'BRL' },
+        })
+        .expect(201);
+      const submit = (server: App, suffix: string) =>
+        request(server)
+          .post('/wagering/transactions')
+          .set('Idempotency-Key', `instance-${suffix}-${crypto.randomUUID()}`)
+          .send({
+            providerId: 'provider-multi-instance',
+            externalTransactionId: `instance-tx-${suffix}-${crypto.randomUUID()}`,
+            playerId,
+            walletId: wallet.body.id,
+            roundId: 'instance-round',
+            gameId: 'instance-game',
+            kind: 'BET',
+            money: { amount: '80.00', currency: 'BRL' },
+          });
+
+      const responses = await Promise.all([
+        submit(app.getHttpServer(), 'a'),
+        submit(secondApp.getHttpServer(), 'b'),
+      ]);
+      expect(
+        responses
+          .map(({ status }) => status)
+          .sort((left, right) => left - right),
+      ).toEqual([200, 422]);
+
+      const reconciliation = await request(app.getHttpServer())
+        .post(`/wallets/${wallet.body.id as string}/reconciliation`)
+        .expect(200);
+      expect(reconciliation.body.consistent).toBe(true);
+      expect(reconciliation.body.storedBalance).toEqual({
+        amount: '20.00',
+        currency: 'BRL',
+      });
+    } finally {
+      await secondApp.close();
+    }
   });
 
   it('returns pending-reference status and requires an idempotency key', async () => {
@@ -447,11 +499,13 @@ async function waitForTransactionStatus(
   app: INestApplication<App>,
   transactionId: string,
   expectedStatus: string,
-): Promise<Record<string, unknown> & {
-  failureCode: string | null;
-  referenceAttempts: number;
-  nextReferenceAttemptAt: string | null;
-}> {
+): Promise<
+  Record<string, unknown> & {
+    failureCode: string | null;
+    referenceAttempts: number;
+    nextReferenceAttemptAt: string | null;
+  }
+> {
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
     const response = await request(app.getHttpServer()).get(

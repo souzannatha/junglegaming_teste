@@ -140,6 +140,30 @@ describe('Wagering SQS consumer (e2e)', () => {
         'all',
       );
     expect(ledgerRows[0]?.entry_count).toBe(2);
+
+    await app.close();
+    const restartedModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+    app = restartedModule.createNestApplication();
+    await app.init();
+    orm = app.get(MikroORM);
+    wageringService = app.get(WageringService);
+
+    const replayAfterRestart = await wageringService.submitWager(
+      transaction,
+      command.idempotencyKey,
+      command.correlationId,
+      { consumerName, messageId },
+    );
+    expect(replayAfterRestart.body.duplicateMessage).toBe(true);
+    const balanceAfterRestart = await request(app.getHttpServer())
+      .get(`/wallets/${wallet.body.id as string}`)
+      .expect(200);
+    expect(balanceAfterRestart.body.balance).toEqual({
+      amount: '90.00',
+      currency: 'BRL',
+    });
   }, 20_000);
 
   it('moves malformed permanent messages to the configured FIFO dead-letter queue', async () => {

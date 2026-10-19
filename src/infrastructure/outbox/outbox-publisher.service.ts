@@ -5,10 +5,18 @@ import {
   SQSClient,
   type MessageAttributeValue,
 } from '@aws-sdk/client-sqs';
-import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+  Optional,
+} from '@nestjs/common';
 import { Inject } from '@nestjs/common';
 import { EntityManager, MikroORM } from '@mikro-orm/core';
 import { randomUUID } from 'node:crypto';
+import { MetricsService } from '../../observability/metrics.service.js';
+import { WorkerHealthService } from '../../observability/worker-health.service.js';
 
 interface ClaimedOutboxEvent {
   id: string;
@@ -30,9 +38,7 @@ interface IntegrationEventEnvelope {
 }
 
 @Injectable()
-export class OutboxPublisher
-  implements OnModuleInit, OnModuleDestroy
-{
+export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(OutboxPublisher.name);
   private readonly enabled = process.env.OUTBOX_PUBLISHER_ENABLED !== 'false';
   private readonly queueName = readStringSetting(
@@ -82,7 +88,15 @@ export class OutboxPublisher
   private timer: ReturnType<typeof setInterval> | undefined;
   private activeBatch: Promise<number> | undefined;
 
-  constructor(@Inject(MikroORM) private readonly orm: MikroORM) {
+  constructor(
+    @Inject(MikroORM) private readonly orm: MikroORM,
+    @Optional()
+    @Inject(MetricsService)
+    private readonly metrics?: MetricsService,
+    @Optional()
+    @Inject(WorkerHealthService)
+    private readonly workerHealth?: WorkerHealthService,
+  ) {
     const endpoint = readOptionalStringSetting('SQS_ENDPOINT');
     const region = readStringSetting('AWS_REGION', 'us-east-1', 128);
     this.client = new SQSClient({
@@ -91,8 +105,7 @@ export class OutboxPublisher
       ...(endpoint
         ? {
             credentials: {
-              accessKeyId:
-                process.env.AWS_ACCESS_KEY_ID?.trim() || 'test',
+              accessKeyId: process.env.AWS_ACCESS_KEY_ID?.trim() || 'test',
               secretAccessKey:
                 process.env.AWS_SECRET_ACCESS_KEY?.trim() || 'test',
             },
@@ -103,11 +116,12 @@ export class OutboxPublisher
 
   async onModuleInit(): Promise<void> {
     if (!this.enabled) {
+      this.workerHealth?.setState('outbox-publisher', 'disabled');
       this.logger.log('Outbox publisher is disabled by configuration');
       return;
     }
 
-    await this.resolveQueueUrl();
+    this.workerHealth?.setState('outbox-publisher', 'starting');
     this.timer = setInterval(() => this.kickBatch(), this.pollIntervalMs);
     this.timer.unref();
     this.kickBatch();
@@ -144,7 +158,12 @@ export class OutboxPublisher
       return;
     }
     this.activeBatch = this.publishDueBatch()
+      .then((published) => {
+        this.workerHealth?.setState('outbox-publisher', 'ready');
+        return published;
+      })
       .catch((error: unknown) => {
+        this.workerHealth?.setState('outbox-publisher', 'unavailable');
         this.logger.error(
           JSON.stringify({
             event: 'outbox_publish_batch_failed',
@@ -163,10 +182,12 @@ export class OutboxPublisher
       return this.queueUrl;
     }
     if (!this.queueUrlPromise) {
-      this.queueUrlPromise = this.lookupOrCreateQueue().catch((error: unknown) => {
-        this.queueUrlPromise = undefined;
-        throw error;
-      });
+      this.queueUrlPromise = this.lookupOrCreateQueue().catch(
+        (error: unknown) => {
+          this.queueUrlPromise = undefined;
+          throw error;
+        },
+      );
     }
     return this.queueUrlPromise;
   }
@@ -193,7 +214,10 @@ export class OutboxPublisher
       throw new Error(`SQS did not create queue ${this.queueName}`);
     }
     this.logger.log(
-      JSON.stringify({ event: 'outbox_queue_created', queueName: this.queueName }),
+      JSON.stringify({
+        event: 'outbox_queue_created',
+        queueName: this.queueName,
+      }),
     );
     return created.QueueUrl;
   }
@@ -235,7 +259,9 @@ export class OutboxPublisher
         envelope.eventId !== event.event_id ||
         envelope.eventType !== event.event_type
       ) {
-        throw new Error('Outbox event envelope does not match its database row');
+        throw new Error(
+          'Outbox event envelope does not match its database row',
+        );
       }
       const messageAttributes: Record<string, MessageAttributeValue> = {
         EventId: {
@@ -258,6 +284,7 @@ export class OutboxPublisher
           MessageAttributes: messageAttributes,
         }),
       );
+      this.workerHealth?.setState('outbox-publisher', 'ready');
 
       const updated = await executeRows<{ id: string }>(
         this.orm.em,
@@ -275,11 +302,16 @@ export class OutboxPublisher
             eventId: event.event_id,
           }),
         );
+      } else {
+        this.metrics?.record('wagering_outbox_events_total', 'published');
       }
       return updated.length > 0;
     } catch (error) {
+      this.workerHealth?.setState('outbox-publisher', 'unavailable');
+      this.metrics?.record('wagering_outbox_events_total', 'failed');
       const nextAttemptAt = new Date(
-        Date.now() + retryDelay(this.retryBaseMs, this.retryMaxMs, event.attempts),
+        Date.now() +
+          retryDelay(this.retryBaseMs, this.retryMaxMs, event.attempts),
       );
       try {
         await executeRows<{ id: string }>(
@@ -289,12 +321,7 @@ export class OutboxPublisher
              last_error = ?
            where id = ? and lease_token = ? and published_at is null
            returning id`,
-          [
-            nextAttemptAt,
-            errorName(error),
-            event.id,
-            event.lease_token,
-          ],
+          [nextAttemptAt, errorName(error), event.id, event.lease_token],
         );
       } catch (persistenceError) {
         this.logger.error(
@@ -328,12 +355,9 @@ async function executeRows<T>(
   sql: string,
   params: unknown[],
 ): Promise<T[]> {
-  const result: unknown = await em.getConnection().execute(
-    sql,
-    params,
-    'all',
-    em.getTransactionContext(),
-  );
+  const result: unknown = await em
+    .getConnection()
+    .execute(sql, params, 'all', em.getTransactionContext());
   if (Array.isArray(result)) {
     return result as T[];
   }
@@ -349,9 +373,7 @@ async function executeRows<T>(
 
 function parseEnvelope(value: unknown): IntegrationEventEnvelope {
   const decoded =
-    typeof value === 'string'
-      ? (JSON.parse(value) as unknown)
-      : value;
+    typeof value === 'string' ? (JSON.parse(value) as unknown) : value;
   if (
     decoded === null ||
     typeof decoded !== 'object' ||
@@ -393,8 +415,7 @@ function isQueueMissingError(error: unknown): boolean {
 }
 
 function errorName(error: unknown): string {
-  const name =
-    error instanceof Error ? error.name : 'UnknownError';
+  const name = error instanceof Error ? error.name : 'UnknownError';
   return name.slice(0, 128);
 }
 
@@ -426,11 +447,15 @@ function readIntegerSetting(
     return fallback;
   }
   if (!/^\d+$/.test(raw)) {
-    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
+    throw new Error(
+      `${name} must be an integer between ${minimum} and ${maximum}`,
+    );
   }
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
-    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
+    throw new Error(
+      `${name} must be an integer between ${minimum} and ${maximum}`,
+    );
   }
   return value;
 }

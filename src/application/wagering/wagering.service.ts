@@ -5,6 +5,7 @@ import {
   NotFoundException,
   OnModuleDestroy,
   OnModuleInit,
+  Optional,
   UnprocessableEntityException,
 } from '@nestjs/common';
 import { Inject } from '@nestjs/common';
@@ -28,6 +29,7 @@ import {
 } from '../../domain/wagering/wager-transaction.js';
 import { WagerRules } from '../../domain/wagering/wager-rules.js';
 import { hashWagerPayload } from './canonical-payload.js';
+import { MetricsService } from '../../observability/metrics.service.js';
 import type {
   CreateWalletRequest,
   SubmitWagerRequest,
@@ -91,7 +93,12 @@ export class WageringService implements OnModuleInit, OnModuleDestroy {
   private retryTimer: ReturnType<typeof setInterval> | undefined;
   private retryBatchRunning = false;
 
-  constructor(@Inject(MikroORM) private readonly orm: MikroORM) {}
+  constructor(
+    @Inject(MikroORM) private readonly orm: MikroORM,
+    @Optional()
+    @Inject(MetricsService)
+    private readonly metrics?: MetricsService,
+  ) {}
 
   onModuleInit(): void {
     this.retryTimer = setInterval(() => {
@@ -685,6 +692,7 @@ export class WageringService implements OnModuleInit, OnModuleDestroy {
               nextReferenceAttemptAt: nextReferenceAttemptAt.toISOString(),
             },
           });
+          this.metrics?.record('wagering_reference_retries_total', 'scheduled');
           return true;
         }
 
@@ -708,6 +716,7 @@ export class WageringService implements OnModuleInit, OnModuleDestroy {
             rejectionReason: 'REFERENCE_RETRY_EXHAUSTED',
           },
         });
+        this.metrics?.record('wagering_reference_retries_total', 'rejected');
         return true;
       }
 
@@ -724,6 +733,7 @@ export class WageringService implements OnModuleInit, OnModuleDestroy {
           nextReferenceAttemptAt: null,
         },
       );
+      this.metrics?.record('wagering_reference_retries_total', 'processed');
       return true;
     });
   }
@@ -802,6 +812,10 @@ export class WageringService implements OnModuleInit, OnModuleDestroy {
           }),
         );
       }
+      this.metrics?.record(
+        'wagering_wallet_reconciliations_total',
+        consistent ? 'consistent' : 'inconsistent',
+      );
 
       return {
         walletId,
