@@ -9,6 +9,7 @@ process.env.WAGER_REFERENCE_MAX_ATTEMPTS = '4';
 process.env.WAGER_REFERENCE_BACKOFF_MS = '50';
 process.env.WAGER_REFERENCE_POLL_MS = '10';
 process.env.OUTBOX_PUBLISHER_ENABLED = 'false';
+process.env.WAGERING_SQS_CONSUMER_ENABLED = 'false';
 
 describe('Wagering HTTP API (e2e)', () => {
   let app: INestApplication<App>;

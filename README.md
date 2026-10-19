@@ -68,6 +68,33 @@ Cada alteração financeira grava seu envelope de evento versionado na tabela `o
 
 No ambiente local, o publisher cria a fila standard `wagering-events` no LocalStack se ela não existir. Em produção, configure `AWS_REGION` e `OUTBOX_QUEUE_URL` ou `OUTBOX_QUEUE_NAME`, usando as credenciais fornecidas pela cadeia padrão do SDK; `SQS_ENDPOINT` é opcional e deve apontar para LocalStack em desenvolvimento. `OUTBOX_PUBLISHER_ENABLED=false` pausa o worker. Os limites de polling, tamanho de lote, concorrência, lease e backoff podem ser ajustados pelas variáveis `OUTBOX_PUBLISHER_*` em `.env.example`.
 
+## Entrada SQS resiliente
+
+O consumidor lê comandos da fila FIFO `wagering-commands.fifo`; a fila de entrada e a DLQ FIFO `wagering-commands-dlq.fifo` são criadas e configuradas automaticamente no LocalStack. Configure `WAGERING_QUEUE_URL` e `WAGERING_DLQ_URL` para usar filas provisionadas externamente. A política de redrive envia à DLQ mensagens transitórias que excederem `WAGERING_SQS_MAX_RECEIVE_COUNT`.
+
+O corpo deve ser um objeto JSON com `idempotencyKey`, opcionalmente `correlationId`, e `transaction` no mesmo formato do corpo de `POST /wagering/transactions`, por exemplo:
+
+```json
+{
+  "idempotencyKey": "provider-request-123",
+  "correlationId": "trace-abc",
+  "transaction": {
+    "providerId": "provider-a",
+    "externalTransactionId": "transaction-456",
+    "playerId": "player-789",
+    "walletId": "wallet-id",
+    "roundId": "round-1",
+    "gameId": "game-1",
+    "kind": "BET",
+    "money": { "amount": "10.00", "currency": "BRL" }
+  }
+}
+```
+
+Produtores devem definir `MessageGroupId` de forma estável por carteira (por exemplo, o `walletId`) para preservar a ordem dos comandos daquela carteira; cada envio pode usar `MessageDeduplicationId` único, pois a idempotência financeira é garantida também no PostgreSQL.
+
+O consumidor executa o mesmo caso de uso financeiro da API. O registro de inbox, a transação de wagering, o ledger e a outbox são confirmados atomicamente no PostgreSQL; a mensagem só é removida do SQS após o commit. Redeliveries são deduplicadas por `(consumerName, messageId)` na inbox e pela chave de idempotência do provedor. Erros permanentes de contrato/conflito são encaminhados à DLQ antes do ack; erros transitórios permanecem sem ack para retry e redrive. Rejeições de negócio persistidas são consideradas processadas e podem ser confirmadas. No encerramento, o consumidor aborta o long poll e aguarda o processamento ativo. `WAGERING_SQS_CONSUMER_ENABLED=false` pausa a entrada; nomes, visibilidade, long poll, tamanho do lote e redrive são configuráveis pelas variáveis `WAGERING_*` em `.env.example`.
+
 ## Verificações
 
 ```sh

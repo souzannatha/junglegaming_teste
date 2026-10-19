@@ -9,7 +9,7 @@ import {
 } from '@nestjs/common';
 import { Inject } from '@nestjs/common';
 import { EntityManager, MikroORM } from '@mikro-orm/core';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   WagerFailureCode,
   WagerRuleViolationError,
@@ -53,6 +53,11 @@ interface RetryState {
   nextReferenceAttemptAt: Date | null;
 }
 
+interface InboxMessageContext {
+  consumerName: string;
+  messageId: string;
+}
+
 const TRANSACTION_SELECT = `
   select id, provider_id, external_transaction_id, idempotency_key,
     payload_hash, wallet_id, player_id, round_id, game_id, kind, amount,
@@ -86,9 +91,7 @@ export class WageringService implements OnModuleInit, OnModuleDestroy {
   private retryTimer: ReturnType<typeof setInterval> | undefined;
   private retryBatchRunning = false;
 
-  constructor(
-    @Inject(MikroORM) private readonly orm: MikroORM,
-  ) {}
+  constructor(@Inject(MikroORM) private readonly orm: MikroORM) {}
 
   onModuleInit(): void {
     this.retryTimer = setInterval(() => {
@@ -307,205 +310,260 @@ export class WageringService implements OnModuleInit, OnModuleDestroy {
     request: SubmitWagerRequest,
     idempotencyKey: string,
     correlationId: string,
+    inboxMessage?: InboxMessageContext,
   ): Promise<ProcessResult> {
     const payloadHash = hashWagerPayload(request);
     return this.orm.em.transactional(async (em) => {
-      const existing = await findByIdempotencyKey(
-        em,
-        request.providerId,
-        idempotencyKey,
-      );
-      if (existing) {
-        return replay(existing, payloadHash);
-      }
-
-      const walletRows = await query(
-        em,
-        `select id, player_id, currency, balance, version, created_at,
-           updated_at
-         from wallets where id = ? for update`,
-        [request.walletId],
-      );
-      const walletRow = walletRows[0];
-      if (!walletRow) {
-        throw new NotFoundException({
-          code: 'WALLET_NOT_FOUND',
-          message: 'Wallet was not found',
-        });
-      }
-      if (
-        String(walletRow.player_id) !== request.playerId ||
-        String(walletRow.currency) !== request.money.currency
-      ) {
-        throw new UnprocessableEntityException({
-          code: 'WALLET_CONTEXT_MISMATCH',
-          message: 'Player and currency must match the wallet',
-        });
-      }
-
-      const afterLock = await findByIdempotencyKey(
-        em,
-        request.providerId,
-        idempotencyKey,
-      );
-      if (afterLock) {
-        return replay(afterLock, payloadHash);
-      }
-
-      const externalDuplicate = await query(
-        em,
-        `${TRANSACTION_SELECT}
-         where provider_id = ? and external_transaction_id = ?`,
-        [request.providerId, request.externalTransactionId],
-      );
-      if (externalDuplicate[0]) {
-        throw new ConflictException({
-          code: 'EXTERNAL_TRANSACTION_CONFLICT',
-          message: 'External transaction ID is already in use',
-        });
-      }
-
-      const wallet = hydrateWallet(walletRow);
-      const now = new Date();
-      const transaction = WagerTransaction.create({
-        id: randomUUID(),
-        providerId: request.providerId,
-        externalTransactionId: request.externalTransactionId,
-        idempotencyKey,
-        payloadHash,
-        walletId: request.walletId,
-        playerId: request.playerId,
-        roundId: request.roundId,
-        gameId: request.gameId,
-        kind: request.kind,
-        money: request.money,
-        referenceExternalTransactionId:
-          request.referenceExternalTransactionId,
-        createdAt: now,
-      });
-
-      const reference = request.referenceExternalTransactionId
-        ? await findReference(
-            em,
-            request.providerId,
-            request.referenceExternalTransactionId,
-          )
-        : undefined;
-
-      if (
-        (transaction.kind === WagerTransactionKind.Refund ||
-          transaction.kind === WagerTransactionKind.Rollback) &&
-        transaction.referenceExternalTransactionId !== undefined
-      ) {
-        const previousReversals = await findReversals(
+      if (inboxMessage) {
+        const inboxPayloadHash = createHash('sha256')
+          .update(`${idempotencyKey}\n${payloadHash}`)
+          .digest('hex');
+        const inserted = await query(
           em,
-          transaction.providerId,
-          transaction.referenceExternalTransactionId,
+          `insert into inbox_messages
+            (consumer_name, message_id, payload_hash, received_at, processed_at)
+           values (?, ?, ?, ?, null)
+           on conflict do nothing
+           returning message_id`,
+          [
+            inboxMessage.consumerName,
+            inboxMessage.messageId,
+            inboxPayloadHash,
+            new Date(),
+          ],
         );
-        if (previousReversals.length > 0) {
-          let duplicateReversal = !reference;
-          if (reference) {
-            try {
-              WagerRules.validateReference(
-                transaction,
-                reference,
-                previousReversals,
-              );
-            } catch (error) {
-              duplicateReversal =
-                error instanceof WagerRuleViolationError &&
-                error.failureCode === WagerFailureCode.ReferenceAlreadyReversed;
-              if (!(error instanceof WagerRuleViolationError)) {
-                throw error;
-              }
-            }
-          }
-          if (duplicateReversal) {
-            transaction.reject(WagerFailureCode.ReferenceAlreadyReversed);
-            await insertRejectedTransaction(em, transaction, wallet);
-            await insertOutboxEvent(em, {
-              id: randomUUID(),
-              aggregateId: wallet.id,
-              eventType: 'WagerTransactionRejected',
-              occurredAt: now,
-              correlationId,
-              causationId: transaction.id,
-              data: {
-                ...transactionEventData(transaction, wallet),
-                failureCode: transaction.failureCode,
-              },
+
+        if (inserted.length === 0) {
+          const existingInbox = await query(
+            em,
+            `select payload_hash from inbox_messages
+             where consumer_name = ? and message_id = ?`,
+            [inboxMessage.consumerName, inboxMessage.messageId],
+          );
+          if (
+            !existingInbox[0] ||
+            String(existingInbox[0].payload_hash) !== inboxPayloadHash
+          ) {
+            throw new ConflictException({
+              code: 'INBOX_MESSAGE_CONFLICT',
+              message: 'SQS message ID was reused with a different payload',
             });
-            return formatTransactionResult(transaction, wallet, false);
           }
+          return {
+            httpStatus: 200,
+            body: { duplicateMessage: true, idempotentReplay: true },
+          };
         }
       }
 
-      if (!(await insertPendingTransaction(em, transaction))) {
-        const concurrentReplay = await findByIdempotencyKey(
+      try {
+        const existing = await findByIdempotencyKey(
           em,
           request.providerId,
           idempotencyKey,
         );
-        if (concurrentReplay) {
-          return replay(concurrentReplay, payloadHash);
+        if (existing) {
+          return replay(existing, payloadHash);
         }
-        throw new ConflictException({
-          code: 'EXTERNAL_TRANSACTION_CONFLICT',
-          message: 'External transaction ID is already in use',
-        });
-      }
-      const referenceIsStillPending =
-        reference?.status === WagerTransactionStatus.Pending ||
-        reference?.status === WagerTransactionStatus.PendingReference;
-      if (
-        request.referenceExternalTransactionId !== undefined &&
-        (!reference || referenceIsStillPending)
-      ) {
-        transaction.markPendingReference();
-        const nextReferenceAttemptAt = new Date(
-          now.getTime() + this.referenceBackoffMs,
-        );
-        await query(
+
+        const walletRows = await query(
           em,
-          `update wager_transactions
+          `select id, player_id, currency, balance, version, created_at,
+           updated_at
+         from wallets where id = ? for update`,
+          [request.walletId],
+        );
+        const walletRow = walletRows[0];
+        if (!walletRow) {
+          throw new NotFoundException({
+            code: 'WALLET_NOT_FOUND',
+            message: 'Wallet was not found',
+          });
+        }
+        if (
+          String(walletRow.player_id) !== request.playerId ||
+          String(walletRow.currency) !== request.money.currency
+        ) {
+          throw new UnprocessableEntityException({
+            code: 'WALLET_CONTEXT_MISMATCH',
+            message: 'Player and currency must match the wallet',
+          });
+        }
+
+        const afterLock = await findByIdempotencyKey(
+          em,
+          request.providerId,
+          idempotencyKey,
+        );
+        if (afterLock) {
+          return replay(afterLock, payloadHash);
+        }
+
+        const externalDuplicate = await query(
+          em,
+          `${TRANSACTION_SELECT}
+         where provider_id = ? and external_transaction_id = ?`,
+          [request.providerId, request.externalTransactionId],
+        );
+        if (externalDuplicate[0]) {
+          throw new ConflictException({
+            code: 'EXTERNAL_TRANSACTION_CONFLICT',
+            message: 'External transaction ID is already in use',
+          });
+        }
+
+        const wallet = hydrateWallet(walletRow);
+        const now = new Date();
+        const transaction = WagerTransaction.create({
+          id: randomUUID(),
+          providerId: request.providerId,
+          externalTransactionId: request.externalTransactionId,
+          idempotencyKey,
+          payloadHash,
+          walletId: request.walletId,
+          playerId: request.playerId,
+          roundId: request.roundId,
+          gameId: request.gameId,
+          kind: request.kind,
+          money: request.money,
+          referenceExternalTransactionId:
+            request.referenceExternalTransactionId,
+          createdAt: now,
+        });
+
+        const reference = request.referenceExternalTransactionId
+          ? await findReference(
+              em,
+              request.providerId,
+              request.referenceExternalTransactionId,
+            )
+          : undefined;
+
+        if (
+          (transaction.kind === WagerTransactionKind.Refund ||
+            transaction.kind === WagerTransactionKind.Rollback) &&
+          transaction.referenceExternalTransactionId !== undefined
+        ) {
+          const previousReversals = await findReversals(
+            em,
+            transaction.providerId,
+            transaction.referenceExternalTransactionId,
+          );
+          if (previousReversals.length > 0) {
+            let duplicateReversal = !reference;
+            if (reference) {
+              try {
+                WagerRules.validateReference(
+                  transaction,
+                  reference,
+                  previousReversals,
+                );
+              } catch (error) {
+                duplicateReversal =
+                  error instanceof WagerRuleViolationError &&
+                  error.failureCode ===
+                    WagerFailureCode.ReferenceAlreadyReversed;
+                if (!(error instanceof WagerRuleViolationError)) {
+                  throw error;
+                }
+              }
+            }
+            if (duplicateReversal) {
+              transaction.reject(WagerFailureCode.ReferenceAlreadyReversed);
+              await insertRejectedTransaction(em, transaction, wallet);
+              await insertOutboxEvent(em, {
+                id: randomUUID(),
+                aggregateId: wallet.id,
+                eventType: 'WagerTransactionRejected',
+                occurredAt: now,
+                correlationId,
+                causationId: transaction.id,
+                data: {
+                  ...transactionEventData(transaction, wallet),
+                  failureCode: transaction.failureCode,
+                },
+              });
+              return formatTransactionResult(transaction, wallet, false);
+            }
+          }
+        }
+
+        if (!(await insertPendingTransaction(em, transaction))) {
+          const concurrentReplay = await findByIdempotencyKey(
+            em,
+            request.providerId,
+            idempotencyKey,
+          );
+          if (concurrentReplay) {
+            return replay(concurrentReplay, payloadHash);
+          }
+          throw new ConflictException({
+            code: 'EXTERNAL_TRANSACTION_CONFLICT',
+            message: 'External transaction ID is already in use',
+          });
+        }
+        const referenceIsStillPending =
+          reference?.status === WagerTransactionStatus.Pending ||
+          reference?.status === WagerTransactionStatus.PendingReference;
+        if (
+          request.referenceExternalTransactionId !== undefined &&
+          (!reference || referenceIsStillPending)
+        ) {
+          transaction.markPendingReference();
+          const nextReferenceAttemptAt = new Date(
+            now.getTime() + this.referenceBackoffMs,
+          );
+          await query(
+            em,
+            `update wager_transactions
            set status = ?, result_balance = ?, result_wallet_version = ?,
              next_reference_attempt_at = ?
            where id = ?`,
-          [
-            transaction.status,
-            wallet.balance.toString(),
-            wallet.version,
-            nextReferenceAttemptAt,
-            transaction.id,
-          ],
-        );
-        await insertOutboxEvent(em, {
-          id: randomUUID(),
-          aggregateId: wallet.id,
-          eventType: 'WagerTransactionPendingReference',
-          occurredAt: now,
-          correlationId,
-          causationId: transaction.id,
-          data: {
-            ...transactionEventData(transaction, wallet),
+            [
+              transaction.status,
+              wallet.balance.toString(),
+              wallet.version,
+              nextReferenceAttemptAt,
+              transaction.id,
+            ],
+          );
+          await insertOutboxEvent(em, {
+            id: randomUUID(),
+            aggregateId: wallet.id,
+            eventType: 'WagerTransactionPendingReference',
+            occurredAt: now,
+            correlationId,
+            causationId: transaction.id,
+            data: {
+              ...transactionEventData(transaction, wallet),
+              referenceAttempts: 0,
+              nextReferenceAttemptAt: nextReferenceAttemptAt.toISOString(),
+            },
+          });
+          return formatTransactionResult(transaction, wallet, false, {
             referenceAttempts: 0,
-            nextReferenceAttemptAt: nextReferenceAttemptAt.toISOString(),
-          },
-        });
-        return formatTransactionResult(transaction, wallet, false, {
-          referenceAttempts: 0,
-          nextReferenceAttemptAt,
-        });
-      }
+            nextReferenceAttemptAt,
+          });
+        }
 
-      return processWagerTransaction(
-        em,
-        transaction,
-        wallet,
-        reference,
-        correlationId,
-        now,
-      );
+        return processWagerTransaction(
+          em,
+          transaction,
+          wallet,
+          reference,
+          correlationId,
+          now,
+        );
+      } finally {
+        if (inboxMessage) {
+          await query(
+            em,
+            `update inbox_messages set processed_at = ?
+             where consumer_name = ? and message_id = ?`,
+            [new Date(), inboxMessage.consumerName, inboxMessage.messageId],
+          );
+        }
+      }
     });
   }
 
@@ -590,10 +648,7 @@ export class WageringService implements OnModuleInit, OnModuleDestroy {
       const referenceAttempts = Number(row.reference_attempts ?? 0) + 1;
       const correlationId = randomUUID();
 
-      if (
-        !reference ||
-        reference.status !== WagerTransactionStatus.Processed
-      ) {
+      if (!reference || reference.status !== WagerTransactionStatus.Processed) {
         const retryable =
           !reference ||
           reference.status === WagerTransactionStatus.Pending ||
@@ -797,8 +852,7 @@ async function processWagerTransaction(
               transactionId: transaction.id,
               amount: transaction.money,
               at: now,
-              insufficientFundsCode:
-                transaction.insufficientFundsFailureCode(),
+              insufficientFundsCode: transaction.insufficientFundsFailureCode(),
             })
           : wallet.credit({
               entryId: randomUUID(),
@@ -813,7 +867,12 @@ async function processWagerTransaction(
         `update wallets
          set balance = ?, version = ?, updated_at = ?
          where id = ?`,
-        [wallet.balance.toString(), wallet.version, wallet.updatedAt, wallet.id],
+        [
+          wallet.balance.toString(),
+          wallet.version,
+          wallet.updatedAt,
+          wallet.id,
+        ],
       );
       await insertLedgerEntry(em, ledger, wallet.version);
     }
@@ -861,12 +920,9 @@ async function query(
   sql: string,
   params: unknown[] = [],
 ): Promise<DatabaseRow[]> {
-  const result: unknown = await em.getConnection().execute(
-    sql,
-    params,
-    'all',
-    em.getTransactionContext(),
-  );
+  const result: unknown = await em
+    .getConnection()
+    .execute(sql, params, 'all', em.getTransactionContext());
   if (Array.isArray(result)) {
     return result as DatabaseRow[];
   }
@@ -1287,8 +1343,7 @@ function serializeTransaction(
         ? null
         : String(row.reference_transaction_id),
     status: String(row.status),
-    failureCode:
-      row.failure_code === null ? null : String(row.failure_code),
+    failureCode: row.failure_code === null ? null : String(row.failure_code),
     referenceAttempts: Number(row.reference_attempts ?? 0),
     nextReferenceAttemptAt:
       row.next_reference_attempt_at === null ||
@@ -1353,11 +1408,15 @@ function readIntegerSetting(
     return fallback;
   }
   if (!/^\d+$/.test(raw)) {
-    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
+    throw new Error(
+      `${name} must be an integer between ${minimum} and ${maximum}`,
+    );
   }
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
-    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
+    throw new Error(
+      `${name} must be an integer between ${minimum} and ${maximum}`,
+    );
   }
   return value;
 }

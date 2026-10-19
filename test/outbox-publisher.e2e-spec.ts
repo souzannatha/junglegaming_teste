@@ -15,6 +15,7 @@ const queueName = `outbox-e2e-${randomUUID()}`;
 const sqsEndpoint = process.env.SQS_ENDPOINT ?? 'http://localhost:4566';
 
 process.env.OUTBOX_PUBLISHER_ENABLED = 'false';
+process.env.WAGERING_SQS_CONSUMER_ENABLED = 'false';
 process.env.OUTBOX_QUEUE_NAME = queueName;
 process.env.SQS_ENDPOINT = sqsEndpoint;
 process.env.OUTBOX_PUBLISHER_RETRY_BASE_MS = '50';

@@ -22,6 +22,36 @@ export interface SubmitWagerRequest {
   referenceExternalTransactionId?: string;
 }
 
+export interface SqsWagerCommand {
+  idempotencyKey: string;
+  correlationId?: string;
+  transaction: SubmitWagerRequest;
+}
+
+export function parseSqsWagerCommand(body: unknown): SqsWagerCommand {
+  const input = asRecord(body, 'SQS command');
+  const correlationId =
+    input.correlationId === undefined
+      ? undefined
+      : requiredString(input.correlationId, 'correlationId', 128);
+
+  if (
+    correlationId !== undefined &&
+    !/^[A-Za-z0-9._:-]{1,128}$/.test(correlationId)
+  ) {
+    throw new BadRequestException({
+      code: 'INVALID_CORRELATION_ID',
+      message: 'correlationId contains invalid characters or length',
+    });
+  }
+
+  return {
+    idempotencyKey: requiredString(input.idempotencyKey, 'idempotencyKey', 256),
+    correlationId,
+    transaction: parseSubmitWagerRequest(input.transaction),
+  };
+}
+
 export function parseCreateWalletRequest(body: unknown): CreateWalletRequest {
   const input = asRecord(body);
   const playerId = requiredString(input.playerId, 'playerId', 128);
